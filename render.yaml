@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: elexico-meet-server
+    runtime: node
+    rootDir: .
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
