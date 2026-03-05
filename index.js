@@ -3,6 +3,13 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const mongoose = require("mongoose");
+const Meeting = require("./models/Meeting");
+
+// ─── MongoDB Connection ───────────────────────────────────────────────────────
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("[DB] MongoDB connected successfully"))
+  .catch((err) => console.error("[DB] MongoDB connection failed:", err.message));
 
 // In development / LAN mode, allow all origins so that peers on other
 // devices (e.g. 192.168.x.x, 172.x.x.x) can connect successfully.
@@ -55,6 +62,7 @@ const rooms = new Map();
 const chatHistory = new Map();
 const endedRooms = new Set();
 const pendingKnocks = new Map();
+const meetingRecords = new Map(); // roomCode → { startedAt, host, participants: Map }
 
 // Per-room host tracking:
 //   originalHostPeerId — the original creator; retains permanent host rights
@@ -65,6 +73,31 @@ const roomMeta = new Map();
 const socketPeerMap = new Map();
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/** Save meeting record to MongoDB and clean up meetingRecords map */
+async function saveMeeting(roomCode, endedAt = new Date()) {
+  const record = meetingRecords.get(roomCode);
+  if (!record) return;
+  try {
+    const participantsArray = Array.from(record.participants.values());
+    const days = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    await Meeting.create({
+      roomCode,
+      date:             record.startedAt,
+      day:              days[record.startedAt.getDay()],
+      startedAt:        record.startedAt,
+      endedAt,
+      host:             record.host,
+      participants:     participantsArray,
+      participantCount: participantsArray.length,
+    });
+    console.log(`[DB] Meeting ${roomCode} saved — ${participantsArray.length} participant(s)`);
+  } catch (err) {
+    console.error(`[DB] Failed to save meeting ${roomCode}:`, err.message);
+  } finally {
+    meetingRecords.delete(roomCode);
+  }
+}
 
 /** Demote every peer in the room whose isHost===true and peerId !== keepPeerId */
 function demoteAllExcept(room, keepPeerId, keepDisplayName, io) {
@@ -91,7 +124,7 @@ function pickNextHost(room, excludePeerId) {
 io.on("connection", (socket) => {
   console.log(`[Server] Socket connected: ${socket.id}`);
 
-  socket.on("join-room", ({ roomCode, peerId, displayName, isHost, avatarUrl }) => {
+  socket.on("join-room", ({ roomCode, peerId, displayName, email, isHost, avatarUrl }) => {
     if (!roomCode || !peerId) return;
 
     // Reject join if the room has been permanently ended by the host
@@ -106,6 +139,7 @@ io.on("connection", (socket) => {
     socket.data.roomCode = roomCode;
     socket.data.peerId = peerId;
     socket.data.displayName = displayName;
+    socket.data.email = email || null;
     socket.data.isHost = isHost;
     socket.data.avatarUrl = avatarUrl || null;
     socket.data.isMuted = true;
@@ -116,6 +150,31 @@ io.on("connection", (socket) => {
     if (!rooms.has(roomCode)) {
       rooms.set(roomCode, new Map());
     }
+
+    // ── Meeting record tracking ──────────────────────────────────────────────
+    if (!meetingRecords.has(roomCode)) {
+      meetingRecords.set(roomCode, {
+        startedAt:    new Date(),
+        host:         isHost ? { peerId, name: displayName, email: email || null, avatarUrl: avatarUrl || null } : null,
+        participants: new Map(),
+      });
+    }
+    const record = meetingRecords.get(roomCode);
+    // Update host info if this peer is the original host
+    if (isHost && !record.host) {
+      record.host = { peerId, name: displayName, email: email || null, avatarUrl: avatarUrl || null };
+    }
+    // Add/update participant entry
+    if (!record.participants.has(peerId)) {
+      record.participants.set(peerId, {
+        peerId,
+        name:      displayName,
+        email:     email || null,
+        avatarUrl: avatarUrl || null,
+        joinedAt:  new Date(),
+      });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     const room = rooms.get(roomCode);
 
@@ -197,6 +256,7 @@ io.on("connection", (socket) => {
       socketId: socket.id,
       peerId,
       displayName,
+      email: email || null,
       avatarUrl: avatarUrl || null,
       isHost: effectiveIsHost,
       isMuted: true,
@@ -376,18 +436,16 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("leave-room", ({ roomCode, peerId }) => {
+  socket.on("leave-room", async ({ roomCode, peerId }) => {
     if (roomCode && peerId) {
-      // Remove from socketPeerMap AND clear socket.data so the 'disconnect'
-      // event that fires right after does NOT call handleLeave a second time
       socketPeerMap.delete(socket.id);
       socket.data.roomCode = null;
       socket.data.peerId = null;
-      handleLeave(socket, roomCode, peerId);
+      await handleLeave(socket, roomCode, peerId);
     }
   });
 
-  socket.on("end-room", ({ roomCode, peerId }, ackCallback) => {
+  socket.on("end-room", async ({ roomCode, peerId }, ackCallback) => {
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     const peer = room?.get(peerId);
@@ -405,6 +463,8 @@ io.on("connection", (socket) => {
       return;
     }
     console.log(`[Server] Host ${peerId} ended room ${roomCode} permanently`);
+    // Save meeting record to MongoDB before clearing room data
+    await saveMeeting(roomCode);
     // Mark as permanently ended so no one can rejoin
     endedRooms.add(roomCode);
     const roomKnocks = pendingKnocks.get(roomCode);
@@ -429,19 +489,19 @@ io.on("connection", (socket) => {
     if (typeof ackCallback === "function") ackCallback({ ok: true });
   });
 
-  socket.on("disconnect", (reason) => {
+  socket.on("disconnect", async (reason) => {
     console.log(`[Server] Socket disconnected: ${socket.id} reason: ${reason}`);
     const mapping = socketPeerMap.get(socket.id);
     if (mapping) {
       socketPeerMap.delete(socket.id);
-      handleLeave(socket, mapping.roomCode, mapping.peerId);
+      await handleLeave(socket, mapping.roomCode, mapping.peerId);
     } else if (socket.data.roomCode && socket.data.peerId) {
-      handleLeave(socket, socket.data.roomCode, socket.data.peerId);
+      await handleLeave(socket, socket.data.roomCode, socket.data.peerId);
     }
   });
 });
 
-function handleLeave(socket, roomCode, peerId) {
+async function handleLeave(socket, roomCode, peerId) {
   console.log(`[Server] ${peerId} leaving ${roomCode}`);
 
   const roomKnocks = pendingKnocks.get(roomCode);
@@ -463,6 +523,8 @@ function handleLeave(socket, roomCode, peerId) {
     room.delete(peerId);
 
     if (room.size === 0) {
+      // Save meeting to MongoDB before removing room data
+      await saveMeeting(roomCode);
       rooms.delete(roomCode);
       chatHistory.delete(roomCode);
       roomMeta.delete(roomCode);
